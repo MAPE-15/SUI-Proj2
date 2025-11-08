@@ -2,3 +2,7 @@
 *.d
 fc-sui
 test-bin
+.idea/
+__pycache__/
+.vscode/
+.DS_Store
