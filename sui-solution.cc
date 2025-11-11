@@ -6,6 +6,81 @@
 #include "memusage.h"
 
 
+namespace {
+
+	/* Parent Map Type - parent links are used to reconstruct the solution plan: child -> (parent, action) */
+	using ParentMap = std::map<SearchState, std::pair<SearchState, SearchAction>>;
+
+	/**
+	 * One frame in the iterative DFS "call stack"
+	 *
+	 * @param state: node (search state)
+	 * @param actions: all applicable actions in the node
+	 * @param next: index of the next action to try (default=0)
+	 * @param depth: depth of the node (default=0)
+	 */
+	struct Frame {
+		SearchState state;
+		std::vector<SearchAction> actions;
+		std::size_t next = 0;
+		int depth = 0;
+	};
+
+	/**
+	 * One OPEN entry for A* Search: state, path cost g, and total score f = g + h.
+	 *
+	 * @param state: node (search state)
+	 * @param g: number of actions from the initial state (from the start) (default=0)
+	 * @param f: function: g + h(state) (default=0.0)
+	 */
+	struct OpenEntry {
+		SearchState state;
+		int g = 0;
+		double f = 0.0;
+	};
+
+	/**
+	 * Min-heap: smallest f on top.
+	 * Tie-break: prefer LARGER g when f ties. This usually expands fewer nodes.
+	 */
+	struct OpenCmp {
+		bool operator()(const OpenEntry& a, const OpenEntry& b) const {
+			if (a.f != b.f) return a.f > b.f;   // min-heap by f
+			return a.g < b.g;                   // on tie: prefer deeper (larger g)
+		}
+	};
+
+	/**
+	 * @brief Rebuilds the action plan from the initial state to the given goal state
+	 *
+	 * Rebuild the action plan from init_state to `goal` using the parent map.
+	 * Reconstructs the sequence of actions from init_state to 'goal' state.
+	 * The map stores child -> (parent, action). It follows parents back to the root, collect actions in reverse, then flips once again - after that the plan is reconstructed
+	 * This reconstruction  plan is used for BFS and A* Search
+	 *
+	 * @param goal The final goal state for which the plan should be reconstructed
+	 * @param parent The map of explored states, mapping each child state to its parent state and the action that produced it
+	 * @return A vector of "SearchAction" objects representing the sequence of actions from the initial state to the goal state (in correct execution order)
+	 */
+	std::vector<SearchAction> reconstruct_plan(const SearchState& goal, const ParentMap& parent) {
+		std::vector<SearchAction> plan;
+		const SearchState* cur = &goal;
+
+		while (true) {
+			auto it = parent.find(*cur);
+
+			if (it == parent.end()) break;  // reached the root (no parent)
+
+			plan.push_back(it->second.second);  // action that produced *cur
+			cur = &it->second.first;  // step to parent (stored inside the map)
+		}
+
+		std::reverse(plan.begin(), plan.end());  // flip again
+		return plan;  // final plan
+	}
+
+}  // namespace
+
 /**
  * @brief Checks whether the current resident memory usage is getting too close to the limit.
  *
@@ -16,141 +91,138 @@
  * @param safety  Soft guard band (in bytes) kept below the limit to stop earlier (default: ~50 MiB).
  * @return true if memory usage is near/exceeds the limit (caller should abort gracefully), false otherwise.
  */
-static inline bool nearMemLimit(std::size_t limit_bytes, std::size_t safety = (50ull << 20)) {
-	if (!limit_bytes) return false;          // no limit configured - do not block
-	std::size_t rss = getCurrentRSS();       // current resident set size (bytes)
-	return rss + safety >= limit_bytes;      // true if we are within the guard band
+static bool nearMemLimit(const std::size_t limit_bytes, const std::size_t safety = (50ull << 20)) {
+
+	if (!limit_bytes) return false;  // no limit configured - do not block
+
+	const std::size_t rss = getCurrentRSS();  // current resident set size (bytes)
+
+	// safe comparison without underflow.
+	if (safety >= limit_bytes) {
+		return rss >= limit_bytes;  // guard band exceeds the limit -> any non-zero RSS means “too close”.
+	}
+
+	// avoid overflow
+	return rss + safety >= limit_bytes;  // true if we are within the guard band
 }
 
+
 std::vector<SearchAction> BreadthFirstSearch::solve(const SearchState &init_state) {
-	// trivial case: already solved - empty plan.
+
+	// if the initial state is already a goal, the optimal plan is empty - already solved
 	if (init_state.isFinal()) return {};
 
-	// BFS FIFO queue of states discovered but not yet expanded.
-	std::queue<SearchState> q;
+	// BFS queue (FIFO) - states which are discovered but not yet expanded (queue OPEN)
+	std::queue<SearchState> queue;
 
-	// Visited set and back-pointers:
-	// We use std::set/std::map (ordered by operator<), so we don't need hashing or operator==.
-	std::set<SearchState> visited;  // tracks states we have already generated
-	std::map<SearchState, std::pair<SearchState, SearchAction>> parent; // child → (parent, action)
+	// using set/map ordered by operator<, no need for hashing or operator==
+	std::set<SearchState> visited_states;  // remembers all states which were already seen/visited (list CLOSED)
+	ParentMap parent;  // child -> (parent, action_to_child)
 
-	// Initialize the search.
-	visited.insert(init_state);
-	q.push(init_state);
+	// initialization
+	visited_states.insert(init_state);
+	queue.push(init_state);
 
-	// Reconstructs the action sequence from init_state to 'goal' by following the parent map.
-	// Note: we follow references stored inside 'parent' to avoid copy-assignment of SearchState.
-	auto reconstruct = [&](const SearchState& goal) {
-		std::vector<SearchAction> path;
-		const SearchState* cur = &goal;
+	// Main BFS Loop:
+	// in BFS, the first time a goal is POPPED (from the queue) the shortest path has been found
+	while (!queue.empty()) {
 
-		while (true) {
-			auto it = parent.find(*cur);
-			if (it == parent.end()) break;         // reached the initial state
-			path.push_back(it->second.second);     // action used to enter *cur
-			cur = &it->second.first;               // step to the parent state
-		}
-
-		std::reverse(path.begin(), path.end());     // actions were collected backwards
-		return path;
-	};
-
-	// Standard BFS loop: expand by increasing depth; first time we pop a goal is optimal.
-	while (!q.empty()) {
-
-		// Optional safeguard: stop early if we approach the configured memory limit.
+		// if approached a memory limit, return empty solution (clean exit)
 		if (nearMemLimit(mem_limit_)) return {};
 
-		// Take the next state in FIFO order.
-		SearchState s = std::move(q.front());
-		q.pop();
+		// expand the next state in FIFO order (level by level)
+		SearchState current = std::move(queue.front());
+		queue.pop();
 
-		// If this state is already a goal, we are guaranteed to have a shortest plan.
-		if (s.isFinal()) return reconstruct(s);
+		// early success - if the popped state is a goal, reconstruct the final sequence of action going from start to goal
+		if (current.isFinal()) return reconstruct_plan(current, parent);
 
-		// Generate successors: actions() enumerates applicable moves from 's'.
-		const auto actions = s.actions();
-		for (const auto& a : actions) {
-			// Successor 't' is created by copying 's' and applying action 'a' in-place.
-			SearchState t = s;                  // copy-construct (copy-assignment is disabled)
-			if (!t.execute(a)) continue;        // skip if not applicable (defensive)
+		// generate all actions which are applicable in 'current' and try every successor
+		const auto applicable_actions = current.actions();
+		for (const auto& act : applicable_actions) {
 
-			// BFS invariant: mark visited upon first discovery; never enqueue duplicates.
-			auto ins = visited.insert(t);
-			if (ins.second) {                   // inserted == true → first time we see 't'
-				parent.emplace(t, std::make_pair(s, a));  // remember how we reached 't'
-				if (t.isFinal()) return reconstruct(t);   // fast exit if goal discovered
-				q.push(std::move(t));           // enqueue for future expansion
+			// build the successor by copying 'current' and executing the action
+			SearchState next = current;
+			if (!next.execute(act)) continue;  // skip if action can't be applicable
+
+			// BFS invariant - discover each state once, if 'next' is new, record its parent.
+			// optionally return the 'next' immediately if it's a goal and then enqueue it
+			auto [_, inserted] = visited_states.insert(next);
+			if (inserted) {
+				parent.emplace(next, std::make_pair(current, act));
+
+				// goal state has been discovered, reconstruct the plan immediately
+				if (next.isFinal()) return reconstruct_plan(next, parent);
+
+				queue.push(std::move(next));
 			}
 		}
 
 	}
 
-	// No solution within explored space / aborted due to memory guard.
+	// no solution within the explored space (or aborted due to memory guard)
 	return {};
 }
 
 std::vector<SearchAction> DepthFirstSearch::solve(const SearchState &init_state) {
 
-	// Trivial: already solved
+    // if the initial state is already a goal, the optimal (shortest) plan is empty
     if (init_state.isFinal()) return {};
 
-    // Depth limit counts actions from root; root has depth 0
+    // depth limit counts actions from the root - the root is at depth 0.
     const int max_depth = (depth_limit_ < 0) ? 0 : depth_limit_;
 
-    // One stack frame for iterative DFS
-    struct Frame {
-        SearchState state;
-        std::vector<SearchAction> actions;
-        std::size_t next = 0;
-        int depth = 0;
-    };
+	// iterative DFS data
+	std::vector<Frame> stack;			     // LIFO stack of frames
+	std::vector<SearchAction> current_plan;  // actions along the CURRENT path only
+	stack.reserve(1 << 12);
 
-    // Explicit stack and current action path only (NO global visited, NO parent map)
-    std::vector<Frame> stack;
-    std::vector<SearchAction> path;
-    stack.reserve(1 << 12);
+	// per-path cycle guard (NOT a memo table) - only states on the current recursion line.
+	std::set<SearchState> recursion_guard;
 
-    // Per-path cycle guard: contains only states on the CURRENT path (not a global visited!)
-    std::set<SearchState> on_path;
+	// initialize the search with the root frame.
+	stack.push_back(Frame{init_state, init_state.actions(), 0, 0});
+	recursion_guard.insert(init_state);
 
-    // Init
-    stack.push_back(Frame{init_state, init_state.actions(), 0, 0});
-    on_path.insert(init_state);
+	// Main DFS Loop:
+	while (!stack.empty()) {
 
-    while (!stack.empty()) {
-        // Optional graceful abort near mem limit (recommended)
-        if (nearMemLimit(mem_limit_)) return {};
+		// if approached a memory limit, return empty solution (clean exit)
+		if (nearMemLimit(mem_limit_)) return {};
 
-        Frame &f = stack.back();
+		auto &[state, actions, next, depth] = stack.back();
 
-        // Goal test
-        if (f.state.isFinal()) return path;
+		// goal test on the node at the top of the stack.
+		if (state.isFinal()) return current_plan;
 
-        // Depth limit / no more actions -> backtrack
-        if (f.depth >= max_depth || f.next >= f.actions.size()) {
-            on_path.erase(f.state);
-            stack.pop_back();
-            if (!path.empty()) path.pop_back();   // remove action that led here
-            continue;
-        }
+		// if depth limit has been reached or ran out of actions here - backtrack
+		if (depth >= max_depth || next >= actions.size()) {
+			recursion_guard.erase(state);
+			stack.pop_back();
 
-        // Expand next successor
-        const SearchAction &a = f.actions[f.next++];
-        SearchState child = f.state;              // copy-construct (assignment is disabled)
-        if (!child.execute(a)) continue;
+			if (!current_plan.empty()) current_plan.pop_back();  // drop action that led here
 
-        // Prevent cycles on the current path only (still no global memoization)
-        if (on_path.find(child) != on_path.end()) continue;
+			continue;  // backtrack and restart the main loop
+		}
 
-        // Descend
-        path.push_back(a);
-        if (child.isFinal()) return path;        // fast exit
-        on_path.insert(child);
-        stack.push_back(Frame{child, child.actions(), 0, f.depth + 1});
-    }
+		// expand the next successor from this node
+		const SearchAction &action = actions[next++];
+		SearchState child = state;
+		if (!child.execute(action)) continue;  // skip invalid successors
 
-    // No solution found within given depth/memory constraints
+		// avoid cycles on the current path
+		if (recursion_guard.find(child) != recursion_guard.end()) continue;
+
+		// descend one level deeper
+		current_plan.push_back(action);
+		if (child.isFinal()) return current_plan;  // quick exit if the goal state has been reached
+
+		recursion_guard.insert(child);
+		stack.push_back(Frame{child, child.actions(), 0, depth + 1});
+
+	}
+
+    // no solution within the explored space in certain depth (or aborted due to memory guard)
     return {};
 }
 
@@ -159,85 +231,65 @@ double StudentHeuristic::distanceLowerBound(const GameState &state) const {
 }
 
 std::vector<SearchAction> AStarSearch::solve(const SearchState &init_state) {
-	 // Trivial: už je cieľ
+
+	// trivial case - initial state is already a goal, return an empty plan
     if (init_state.isFinal()) return {};
 
-    // Pomocná štruktúra pre OPEN (min-heap podľa f=g+h, pri rovnosti menšie g)
-    struct Node {
-        SearchState state;
-        int g = 0;           // dĺžka cesty (počet akcií)
-        double f = 0.0;      // g + h
-    };
-    struct Cmp {
-        bool operator()(const Node &a, const Node &b) const {
-            if (a.f != b.f) return a.f > b.f; // min-heap (väčšie f má nižšiu prioritu)
-            return a.g > b.g;                 // pri rovnosti preferuj plytšie riešenia
-        }
-    };
+    // queue OPEN (priority queue) and the book-keeping tables
+    std::priority_queue<OpenEntry, std::vector<OpenEntry>, OpenCmp> open;
 
-    // OPEN fronta a tabuľky
-    std::priority_queue<Node, std::vector<Node>, Cmp> open;
+    // best known g for each state (ordered by operator< - no hashing used)
+    std::map<SearchState, int> best_g;
 
-    // Najlepšie známe g(s) pre daný stav (kľúče porovnávané cez operator<)
-    std::map<SearchState, int> g_score;
+    // parent links to reconstruct the plan: child -> (parent, action)
+    ParentMap parent;
 
-    // Rodič → na rekonštrukciu plánu (dieťa -> (rodič, akcia))
-    std::map<SearchState, std::pair<SearchState, SearchAction>> parent;
+    // push the initial state
+    const double h0 = compute_heuristic(init_state, *heuristic_);  // compute the heuristic
+    open.push(OpenEntry{init_state, 0, h0});
+    best_g.emplace(init_state, 0);
 
-    // Heuristika pre počiatočný stav
-    const double h0 = compute_heuristic(init_state, *heuristic_);
-    open.push(Node{init_state, 0, 0.0 + h0});
-    g_score.emplace(init_state, 0);
-
-    // Rekonštrukcia akcií z parent mapy
-    auto reconstruct = [&](const SearchState &goal) {
-        std::vector<SearchAction> path;
-        const SearchState *cur = &goal;
-        while (true) {
-            auto it = parent.find(*cur);
-            if (it == parent.end()) break;
-            path.push_back(it->second.second);
-            cur = &it->second.first;
-        }
-        std::reverse(path.begin(), path.end());
-        return path;
-    };
-
+	// Main A* Search Loop:
+    // expand states until OPEN is empty, or the program exits due to the memory guard
     while (!open.empty()) {
-        // Voliteľná ochrana pamäte – ak sme blízko limitu, vráť prázdne riešenie
+
+		// if approached a memory limit, return empty solution (clean exit)
         if (nearMemLimit(mem_limit_)) return {};
 
-        Node cur = std::move(open.top());
+        OpenEntry cur = open.top();
         open.pop();
 
-        // "Outdated queue entry" ochrana: preskoč, ak už máme lepšie g v tabuľke
-        auto it_g = g_score.find(cur.state);
-        if (it_g != g_score.end() && cur.g > it_g->second) continue;
+        // skip outdated queue entries (shorter path has already been found to this state)
+		if (auto itg = best_g.find(cur.state); itg != best_g.end() && cur.g > itg->second) continue;
 
-        // Cieľ test – pri A* je optimálne ukončiť, keď cieľ POP-neme z OPEN
-        if (cur.state.isFinal()) return reconstruct(cur.state);
+        // A* is optimally completed, when a goal state is POPPED from the OPEN queue - if so, return the optimal plan
+        if (cur.state.isFinal()) return reconstruct_plan(cur.state, parent);
 
-        // Rozbaľ susedov
+        // expand successors (unit cost per action)
         const auto actions = cur.state.actions();
-        for (const auto &a : actions) {
-            SearchState succ = cur.state;   // copy-construct (assign je zakázaný)
+        for (const auto& a : actions) {
+
+        	// also inside the hot loop, if approached a memory limit, return empty solution (clean exit)
+            if (nearMemLimit(mem_limit_)) return {};
+
+            SearchState succ = cur.state;
             if (!succ.execute(a)) continue;
 
-            const int tentative_g = cur.g + 1; // jednotkový náklad za akciu
+            const int tentative_g = cur.g + 1;
 
-            // Ak nemáme g(succ) alebo tentatívne g je lepšie, aktualizuj
-            auto it = g_score.find(succ);
-            if (it == g_score.end() || tentative_g < it->second) {
-                g_score[succ] = tentative_g;
-                parent.emplace(succ, std::make_pair(cur.state, a));
+            // if 'succ' has never been seen, or a better path has been just found to it, record/update it.
+	        if (auto it = best_g.find(succ); it == best_g.end() || tentative_g < it->second) {
+                best_g[succ] = tentative_g;
 
-                // Heuristika – zadanie povoľuje 2 varianty; "student" vracia 0 → A* == BFS
+                // IMPORTANT - overwrite parent (emplace would NOT replace older entry)
+	        	parent.insert_or_assign(succ, std::pair{cur.state, a});
+
                 const double h = compute_heuristic(succ, *heuristic_);
-                open.push(Node{succ, tentative_g, tentative_g + h});
+                open.push(OpenEntry{succ, tentative_g, tentative_g + h});
             }
         }
     }
 
-    // Nenašli sme riešenie v daných hraniciach (alebo sme skončili kvôli pamäti)
+	// no solution within the explored space with given limits (or aborted due to memory guard)
     return {};
 }
