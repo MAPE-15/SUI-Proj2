@@ -41,12 +41,12 @@ namespace {
 
 	/**
 	 * Min-heap: smallest f on top.
-	 * Tie-break: prefer LARGER g when f ties. This usually expands fewer nodes.
+	 * Tie-break: prefer SMALLER g when f ties. This usually expands fewer nodes.
 	 */
 	struct OpenCmp {
 		bool operator()(const OpenEntry& a, const OpenEntry& b) const {
 			if (a.f != b.f) return a.f > b.f;   // min-heap by f
-			return a.g < b.g;                   // on tie: prefer deeper (larger g)
+			return a.g > b.g;                   // on tie: prefer shallower (smaller g)
 		}
 	};
 
